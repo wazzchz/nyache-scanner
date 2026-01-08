@@ -31,15 +31,43 @@ def gerar_chave(tamanho=6):
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=tamanho))
 
 
+def enviar_chave_webhook(chave):
+    """Envia apenas a chave para o webhook"""
+    import requests
+    
+    payload = {
+        "username": "Nyache Scanner",
+        "avatar_url": "https://i.supaimg.com/bdea323d-8607-4047-9d59-28a544d66cf3.jpg",
+        "content": f"🔑 Nova chave de escaneamento gerada: `{chave}`"
+    }
+    
+    try:
+        requests.post(WEBHOOK_URL, json=payload, timeout=5)
+        print("✅ Chave enviada para o webhook com sucesso!")
+        print("📱 Verifique o Discord para obter a chave de acesso.")
+    except Exception:
+        print("⚠️ Não foi possível enviar a chave para o webhook.")
+        print("🔑 Chave de emergência: " + chave)
+        print("(Configure manualmente a chave no script se necessário)")
+
+
 def solicitar_chave(key_gerada):
     print("╔═╗╦ ╦╔═╗ ╔═╗╔═╗╦  ╦╔═╗")
     print("╠═╣║║║║╣  ╠═╣║  ║  ║║ ║")
     print("╩ ╩╚╩╝╚═╝╩╩ ╩╚═╝╩═╝╩╚═╝")
+    print("-" * 40)
+    print("A chave foi enviada para o webhook do Discord.")
+    print("Verifique a mensagem no canal configurado.")
+    print("-" * 40)
+    
     entrada = input("Please set scan key: ")
+    
     if entrada != key_gerada:
         print("❌ Incorrect key, script crashing...")
         sys.exit(1)
-    print("✅ Successfuel identify, scanning...")
+    
+    print("✅ Successful identification, scanning...")
+    print("=" * 60)
 
 
 def get_system_boot_time():
@@ -57,6 +85,8 @@ def get_system_boot_time():
 def scan_arquivos_modificados_truncados():
     relatorio = []
     boot_time = get_system_boot_time()
+    
+    print("[+] Scanning for modified/truncated files...")
 
     for base_path in CHECK_PATHS:
         output = adb_shell(["find", base_path, "-type", "f"])
@@ -79,6 +109,203 @@ def scan_arquivos_modificados_truncados():
             try:
                 mod_time = datetime.strptime(
                     mtime_match.group(1), "%Y-%m-%d %H:%M:%S"
+                ).timestamp()
+                size = int(size_match.group(1))
+            except:
+                continue
+
+            if boot_time and mod_time > boot_time:
+                if size == 0:
+                    relatorio.append(
+                        f"🛑 ARQUIVO TRUNCADO (0 bytes) E MODIFICADO PÓS-BOOT: {arq}"
+                    )
+                    relatorio.append(f"   - Modificado em: {mtime_match.group(1)}")
+                else:
+                    relatorio.append(f"✏️ ARQUIVO MODIFICADO PÓS-BOOT: {arq}")
+                    relatorio.append(f"   - Modificado em: {mtime_match.group(1)}")
+            else:
+                if size == 0:
+                    relatorio.append(f"⚠️ Arquivo truncado (0 bytes): {arq}")
+
+    return relatorio
+
+
+def scan_arquivos_deletados_logcat():
+    print("[+] Scanning for deleted files in logcat...")
+    
+    filtro_delecao = r"unlink|delete|remove|rm -rf|rmdir|removed package"
+    try:
+        logcat_output = subprocess.check_output(
+            ["adb", "logcat", "-d"], stderr=subprocess.DEVNULL
+        ).decode("utf-8", errors="ignore")
+    except Exception:
+        return []
+
+    linhas_delecao = []
+    for linha in logcat_output.splitlines():
+        if re.search(filtro_delecao, linha, re.I):
+            linhas_delecao.append(f"🗑️ {linha.strip()}")
+
+    return linhas_delecao
+
+
+def detect_alteracao_manual_horario():
+    print("[+] Checking for manual time changes...")
+    relatorio = []
+
+    output = subprocess.getoutput("adb logcat -d | grep -i 'time changed'")
+    if output.strip():
+        relatorio.append("⏰ ALTERAÇÃO MANUAL DE HORÁRIO DETECTADA VIA LOGCAT:")
+        relatorio.extend(output.strip().splitlines())
+    else:
+        auto_time = adb_shell(["settings", "get", "global", "auto_time"]).strip()
+        if auto_time == "0":
+            relatorio.append(
+                "⚠️ Horário automático desligado - possível alteração manual."
+            )
+
+    return relatorio
+
+
+def comparar_instalacao_obb():
+    print("[+] Comparing APK installation with OBB files...")
+    relatorio_total = []
+
+    for package_name in PACKAGES_TO_CHECK:
+        relatorio = [f"\n🎮 VERIFICANDO PACOTE: {package_name}"]
+
+        try:
+            install_info = adb_shell(["dumpsys", "package", package_name])
+            install_time = None
+
+            for linha in install_info.splitlines():
+                if "firstInstallTime" in linha:
+                    match = re.search(r"firstInstallTime=(\d+)", linha)
+                    if match:
+                        install_time_ms = int(match.group(1))
+                        install_time = datetime.fromtimestamp(install_time_ms / 1000.0)
+                        relatorio.append(
+                            f"📱 APK Instalado em: {install_time.strftime('%Y-%m-%d %H:%M:%S')}"
+                        )
+                        break
+
+            if not install_time:
+                relatorio.append(
+                    "❌ Não foi possível encontrar a data de instalação do APK."
+                )
+                relatorio_total.extend(relatorio)
+                continue
+
+        except Exception:
+            continue
+
+        obb_dir = f"/storage/emulated/0/Android/obb/{package_name}/"
+        try:
+            output = adb_shell(["find", obb_dir, "-name", "*.obb", "-type", "f"])
+            obb_files = output.strip().splitlines()
+
+            if not obb_files:
+                continue
+
+            latest_obb = None
+            latest_mtime = 0
+
+            for obb in obb_files:
+                if not obb:
+                    continue
+                stat = adb_shell(["stat", obb])
+                mtime_match = re.search(
+                    r"Modify:\s+(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", stat
+                )
+                if mtime_match:
+                    obb_mod_time = datetime.strptime(
+                        mtime_match.group(1), "%Y-%m-%d %H:%M:%S"
+                    ).timestamp()
+                    if obb_mod_time > latest_mtime:
+                        latest_mtime = obb_mod_time
+                        latest_obb = (obb, mtime_match.group(1))
+
+            if latest_obb:
+                obb_path, obb_mod_str = latest_obb
+                obb_time = datetime.fromtimestamp(latest_mtime)
+
+                time_diff = obb_time - install_time
+                diff_days = time_diff.days
+
+                if diff_days < -7:
+                    relatorio.append(
+                        f"🚨 ANOMALIA: O arquivo OBB é muito mais antigo que a instalação do APK. Diferença: {-diff_days} dias."
+                    )
+                elif diff_days > 1:
+                    relatorio.append(
+                        f"⚠️ AVISO: O arquivo OBB é mais novo que a instalação do APK. Diferença: {diff_days} dias."
+                    )
+        except Exception:
+            continue
+
+        relatorio_total.extend(relatorio)
+
+    return relatorio_total
+
+
+def exibir_resultados_terminal(titulo, resultados, cor_simbolo="="):
+    """Exibe os resultados no terminal de forma formatada"""
+    if not resultados:
+        return
+    
+    print(f"\n{'=' * 60}")
+    print(f"📋 {titulo}")
+    print(f"{cor_simbolo * 60}")
+    
+    for resultado in resultados:
+        print(resultado)
+    
+    print(f"{cor_simbolo * 60}")
+
+
+def main():
+    # Gera e envia chave via webhook (NÃO mostra no terminal)
+    print("🔑 Gerando chave de acesso...")
+    key = gerar_chave()
+    enviar_chave_webhook(key)
+    
+    # Solicita chave do usuário (sem mostrar a chave no terminal)
+    solicitar_chave(key)
+    
+    # Executa todas as verificações
+    print("\n[🔍] Iniciando verificações de segurança...")
+    
+    rel_horario = detect_alteracao_manual_horario()
+    rel_modificados = scan_arquivos_modificados_truncados()
+    rel_deletados = scan_arquivos_deletados_logcat()
+    rel_obb = comparar_instalacao_obb()
+    
+    # Exibe todos os resultados no terminal
+    exibir_resultados_terminal("ALTERAÇÃO DE HORÁRIO", rel_horario, "⏰")
+    exibir_resultados_terminal("ARQUIVOS MODIFICADOS/TRUNCADOS", rel_modificados, "✏️")
+    exibir_resultados_terminal("ARQUIVOS DELETADOS", rel_deletados, "🗑️")
+    exibir_resultados_terminal("VERIFICAÇÃO APK & OBB", rel_obb, "🎮")
+    
+    # Resumo final
+    print("\n" + "=" * 60)
+    print("📊 RESUMO DA ANÁLISE")
+    print("=" * 60)
+    
+    tudo_limpo = not any([rel_horario, rel_modificados, rel_deletados, rel_obb])
+    
+    if tudo_limpo:
+        print("✅ Status: SISTEMA LIMPO")
+        print("   Nenhuma atividade suspeita detectada.")
+    else:
+        print("❗ Status: ATIVIDADE SUSPEITA DETECTADA")
+        print("   Verifique os relatórios acima para detalhes.")
+    
+    print(f"\n📅 Data da verificação: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()                    mtime_match.group(1), "%Y-%m-%d %H:%M:%S"
                 ).timestamp()
                 size = int(size_match.group(1))
             except:
